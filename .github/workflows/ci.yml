@@ -1,0 +1,110 @@
+name: ci
+
+# The static checks, on every pull request, with no AWS credentials: nothing
+# here plans against or applies to an account.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  TERRAFORM_VERSION: "1.16.6"
+  TFLINT_VERSION: "0.65.0"
+  TFLINT_SHA256: "d4c545ed2e29d6338604b586f34f544f380f70f243aa72f7b484713835eaec61"
+  TRIVY_VERSION: "0.76.1"
+  TRIVY_SHA256: "c7cbe3137fb8a48a17574bede3dd6beb16742d1e9772929940fc90082c39d9c0"
+
+jobs:
+  terraform:
+    name: fmt, validate, test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform fmt -check -recursive -diff
+
+      # Mocked providers only: the tests make no AWS call.
+      - name: Validate and test each stack and the module
+        run: |
+          for dir in bootstrap modules/server server; do
+            echo "::group::$dir"
+            terraform -chdir="$dir" init -backend=false -input=false
+            terraform -chdir="$dir" validate
+            terraform -chdir="$dir" test
+            echo "::endgroup::"
+          done
+
+  user-data:
+    name: user data (rendered, shellcheck)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+          terraform_wrapper: false
+
+      # The exact script a server boots with, with and without the CloudWatch agent.
+      - name: Render and lint
+        run: |
+          dir=modules/server/user_data
+          terraform -chdir="$dir" init -input=false
+          for agent in false true; do
+            terraform -chdir="$dir" apply -auto-approve -input=false -var region=us-east-1 -var cloudwatch_agent="$agent"
+            terraform -chdir="$dir" output -raw script > "$RUNNER_TEMP/user_data_$agent.sh"
+            shellcheck -s sh "$RUNNER_TEMP/user_data_$agent.sh"
+          done
+
+  tflint:
+    name: tflint
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install tflint ${{ env.TFLINT_VERSION }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/tflint.zip" "https://github.com/terraform-linters/tflint/releases/download/v${TFLINT_VERSION}/tflint_linux_amd64.zip"
+          echo "${TFLINT_SHA256}  $RUNNER_TEMP/tflint.zip" | sha256sum -c -
+          unzip -q -d "$RUNNER_TEMP/bin" "$RUNNER_TEMP/tflint.zip"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      - name: Lint (zero warnings)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          tflint --init --config "$PWD/.tflint.hcl"
+          tflint --recursive --config "$PWD/.tflint.hcl" --minimum-failure-severity=notice
+
+  trivy:
+    name: trivy config
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # The release binary, pinned by its sha256, rather than a third-party action.
+      - name: Install trivy ${{ env.TRIVY_VERSION }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/trivy.tar.gz" "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/trivy.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$RUNNER_TEMP/trivy.tar.gz" -C "$RUNNER_TEMP/bin" trivy
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
+      # No high or critical finding. The lower ones are accepted, each with its
+      # reason, in DESIGN.md; the full report prints first.
+      - name: Scan
+        run: |
+          trivy config --exit-code 0 .
+          trivy config --exit-code 1 --severity HIGH,CRITICAL .

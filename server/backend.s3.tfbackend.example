@@ -1,0 +1,15 @@
+# The S3 backend's account-specific half. Write server/backend.s3.tfbackend
+# (gitignored) from bootstrap's output, not by hand:
+#   terraform -chdir=bootstrap output -raw server_backend > server/backend.s3.tfbackend
+# The other half (key, encrypt, use_lockfile) is in server/versions.tf.
+
+# CHANGE ME: your state bucket, fermix-server-state-<account>-<region>; server_backend writes it.
+bucket = "fermix-server-state-111122223333-us-east-1"
+# CHANGE ME: your region, the one bootstrap/ was applied with.
+region = "us-east-1"
+# CHANGE ME: the ARN of the state key (alias/fermix-server-state) bootstrap made in your account.
+kms_key_id = "arn:aws:kms:us-east-1:111122223333:key/00000000-0000-0000-0000-000000000000"
+# CHANGE ME: your account's deploy role; server/'s state is read and written as it.
+assume_role = {
+  role_arn = "arn:aws:iam::111122223333:role/fermix-server-deploy"
+}
