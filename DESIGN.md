@@ -15,8 +15,12 @@ condition on a new bucket fails.
 
 So the deploy role reaches one bucket, by its exact name, `fermix-server-snapshots-<account>-<region>`,
 which `bootstrap/` and `modules/server/` both build and both stacks' tests pin; the state bucket's
-name, `fermix-server-state-<account>-<region>`, does not match it. On it the role may change the
-bucket's configuration and delete objects (to empty it on destroy), never read or write one.
+name, `fermix-server-state-<account>-<region>`, does not match it. On it the role may read the
+bucket's settings, make the writes `modules/server/storage.tf` makes, each named by IAM's action
+for what the pinned provider calls (a wildcard such as `s3:PutBucket*` would let it add an ACL, a
+website or any other setting), and delete objects (to empty it on destroy); `bootstrap/denies.tf`
+denies every other action on the bucket and its objects, so no ACL, replication, website, logging,
+notification, inventory or Object Lock, and no object read or write.
 
 ## All outbound traffic is allowed
 
@@ -41,6 +45,18 @@ apply. A `check` warns on every plan when the server booted with the other value
 says how to change a running server ("Turning metrics on or off later", "Turning S3 backups on or
 off later"). `modules/server/tests/read_once.tftest.hcl` proves that a newer AMI and a changed user
 data replace nothing.
+
+**And the deploy role cannot write it.** A user data with a boot-time part (`#cloud-boothook`,
+`bootcmd`, a per-boot script) runs code at every boot, and a stop, a change and a start put it
+there with no Session Manager or Run Command call, which neither the session email nor
+`require_session_mfa` sees. `bootstrap/denies.tf` denies `ModifyInstanceAttribute` unless the call
+sets termination protection (`allow_destroy`) or the type (`instance_type`), the only attributes
+`server/` changes: never the user data, kernel or RAM disk, in either of the API's two forms
+(`ec2:Attribute`, the request's attribute name, and `ec2:Attribute/<Name>`, its own field, which
+is how the provider calls it). An attribute it does not name is refused too, so a `server/` change
+that needs one fails at apply, explicitly denied. Every change of an instance attribute in the
+region, or a refused one, sends a security alert email (`fermix-server-instance-attributes`;
+README.md, "The session email").
 
 ## bootstrap makes the server's roles
 
@@ -81,11 +97,23 @@ are two documents, both in `bootstrap/`:
 `bootstrap/tests/findings.tftest.hcl` holds each gap a security review of the boundary found on
 the boundary's own document.
 
-**Little room is left.** In us-east-1 the boundary is about 6,000 of its 6,144 characters and the
-policy about 10,000 of its 10,240. Both name the region, the boundary 20 times and the policy 31,
-so a 14-character region (`ap-southeast-2`) in place of `us-east-1` adds about 5 characters each
-time: about 6,085 and 10,128. Anything added to either needs room found first. A policy that
-passes its limit fails `bootstrap/`'s apply loudly.
+**Little room is left.** In us-east-1 the boundary is 5,985 of its 6,144 characters and the
+policy 9,984 of its 10,240. Both name the region, the boundary 20 times and the policy 31, so a
+14-character region (`ap-southeast-2`) in place of `us-east-1` adds about 5 characters each time:
+6,085 and 10,139. Anything added to either needs room found first.
+`bootstrap/tests/sizes.tftest.hcl` renders every document offline, in us-east-1 and
+`ap-southeast-2`, and fails past a limit, before an apply would.
+
+**The denies the boundary has no room for.** Three more denies do not fit: the boundary with them,
+without `Sid`s, would be about 7,000 characters in us-east-1. They are a third document,
+`bootstrap/denies.tf`, a managed policy of denies alone, which bootstrap attaches to the role
+(1,192 characters; 1,202 in `ap-southeast-2`): the snapshot bucket's other actions, a key policy
+written past KMS's lockout safety check (`kms:BypassPolicyLockoutSafetyCheck`), and every instance
+attribute but termination protection and the type. An explicit deny in any of a role's policies
+refuses the request whatever another allows, so they hold over anything attached later as the
+boundary's do; the role cannot detach the policy (the boundary denies detaching any policy but the
+CloudWatch agent's) or edit it (its IAM rights stop at the two server roles and the instance
+profile).
 
 ## The VPC's default security group is left alone
 
@@ -211,6 +239,25 @@ writer.
   states the block so the rule holds whatever S3's default. Checked against S3: a header-less
   upload passed and took the server key; AES256, SSE-KMS without a key and SSE-KMS with `aws/s3`
   were refused with the policy's explicit deny.
+- **What the deploy role's limits hold.** Only `admin_role_arn` assumes the role, and `server/`'s
+  provider assumes it from your own credentials, so its boundary and denies contain a mistake or a
+  module acting through the role, not a malicious provider, which holds your credentials. They keep
+  the role to the server stack's resources, not away from their data: it still terminates the
+  server and the home on it, writes the bucket's policy, the server key's policy and the public
+  access block, any of which can open the bucket to another account (IAM has no condition on a
+  policy's contents). It cannot change the user data, and no way is known for it to run code on
+  the server or read its disk: it launches only Debian's image and snapshot, makes no volume from
+  the server's snapshots and attaches none. Moving the bucket's and the key's policies into
+  `bootstrap/` would close the other account's way in; it is not done here.
+- **DLM tags only the stack's snapshots.** `ec2:CreateTags` on every snapshot in the region would
+  let the DLM role give any snapshot the server tag and, with it, `DeleteSnapshot` and the snapshot
+  removal in README.md, "Removing the server". So the server roles' boundary lets it tag a snapshot
+  only in the create that takes it (`ec2:CreateAction` `CreateSnapshot` or `CreateSnapshots`) or
+  one already carrying the tag: DLM's tags reach a new snapshot in `CreateSnapshot`'s request (a
+  scheduled snapshot passes the boundary's `aws:RequestTag` condition, which only a request's tags
+  set) and any it adds later reach a snapshot that has the tag, so the daily snapshot works
+  whichever way DLM tags. The policy's `tags_to_add` and `copy_tags` carry only the volume's tags
+  and the stack's.
 - **bootstrap makes a minimal CloudTrail trail** (`enable_cloudtrail`, on by default): EventBridge
   receives `AWS API Call via CloudTrail` events only while a trail logs them (EventBridge User
   Guide, "AWS service events delivered via AWS CloudTrail"), and the session email needs

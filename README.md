@@ -246,8 +246,9 @@ Without an address there is no topic and no budget, and the alarm exists without
 ### The session email
 
 With `alert_emails` set in `bootstrap/`, every Session Manager session that starts or resumes in
-the account's region, and every Run Command command sent there, sends an email to each address
-through bootstrap's security alert topic, `fermix-owner-security-alerts`:
+the account's region, every Run Command command sent there, and every EC2 instance attribute
+changed there (or a change refused), sends an email to each address through bootstrap's security
+alert topic, `fermix-owner-security-alerts`:
 
 ```
 fermix-server: a Session Manager StartSession.
@@ -260,11 +261,16 @@ When: <time>, from <address>
 A non-interactive session's request also names its document and command; a resume's names only
 the session, which its start's email tied to an instance. A command's email (`fermix-server: a Run
 Command SendCommand.`, rule `fermix-server-commands`) names the instances or targets, the document
-and the command id; CloudTrail hides the commands themselves. bootstrap's EventBridge rule
-`fermix-server-sessions` matches CloudTrail's `StartSession` and `ResumeSession` and sends to the
-security alert topic, which takes messages from bootstrap's three rules alone, by their ARNs.
-bootstrap does not know the instance id, so the rule matches every session in the account and
-region, and the email names the instance. SNS emails only a confirmed subscription.
+and the command id; CloudTrail hides the commands themselves. An instance attribute's email
+(`fermix-server: an EC2 ModifyInstanceAttribute.`, rule `fermix-server-instance-attributes`) names
+the instance and the attribute (CloudTrail hides user data) and, when refused, the error code: a
+new user data is code the instance runs at its next boot without a session, which the deploy role
+is denied, and `server/`'s own applies send one each time `allow_destroy` or `instance_type`
+changes. bootstrap's EventBridge rule `fermix-server-sessions` matches CloudTrail's `StartSession`
+and `ResumeSession` and sends to the security alert topic, which takes messages from bootstrap's
+four rules alone, by their ARNs. bootstrap does not know the instance id, so the rules match every
+session, command and instance in the account and region, and the email names the instance. SNS
+emails only a confirmed subscription.
 RUNBOOK.md, "A session email you did not expect", says what to do with one.
 
 The topic is bootstrap's, not the server's `fermix-server-alerts`, because the deploy role manages
@@ -454,6 +460,9 @@ to write for another principal. What it does:
   (`bootstrap/tests/bootstrap.tftest.hcl`);
 - every session that starts or resumes in the account's region sends an email that names who
   ("The session email");
+- the deploy role cannot change the server's user data, which runs code at boot with no session
+  or command, and every change of an instance attribute in the region, or a refused one, emails
+  too ("The session email");
 - with `require_session_mfa`, `admin_role_arn`'s own sessions need MFA ("Sessions with MFA").
 
 The server's side was tried and does not hold. Session Manager tags each session with the user id
@@ -507,9 +516,10 @@ the key.
 
 The role's own policy (`bootstrap/permissions.tf`, inline: it is longer than a managed policy may
 be) names every action `server/` uses; its permissions boundary (`bootstrap/boundary.tf`) is the
-ceiling over that policy and anything attached later, and holds the denies.
-[`bootstrap/POLICY.md`](bootstrap/POLICY.md) lists every action, resource type and condition in
-both. In short:
+ceiling over that policy and anything attached later, and holds the denies, with
+`bootstrap/denies.tf`, a managed policy of denies attached to the role, for those the boundary has
+no room for. [`bootstrap/POLICY.md`](bootstrap/POLICY.md) lists every action, resource type and
+condition in all three. In short:
 
 - `server/terraform.tfstate` and its lock in the state bucket, through the state key; nothing else
   on the key or the bucket.
@@ -517,12 +527,17 @@ both. In short:
   the server stack's tag and changed only while it carries it; a subnet, route table or security
   group only in a tagged VPC; a launch only of Debian's image (`ami_owner_id`), only into a tagged
   subnet and security group, never with an existing interface, and with no key pair, launch
-  template or any resource but the seven it uses. No snapshot is ever shared.
+  template or any resource but the seven it uses. No snapshot is ever shared. Of the instance's
+  attributes it changes termination protection and the type alone: never its user data, kernel or
+  RAM disk, which would run code at the next boot with no session or command to see it.
 - KMS keys, SNS topics, DLM policies, the alarm and the budget, each created only with the tag and
-  managed only while they carry it; no other key or DLM policy can be given the tag.
+  managed only while they carry it; no other key or DLM policy can be given the tag, and no key
+  policy is written past KMS's lockout safety check.
 - The snapshot bucket, by its exact name (DESIGN.md, "The snapshot bucket is scoped by name, not by
-  a tag"): its configuration, and deleting its objects to empty it on destroy, never reading or
-  writing one.
+  a tag"): reading its settings, the writes its resources make, each named (tags, ownership, public
+  access block, versioning, encryption, lifecycle, policy), and deleting its objects to empty it on
+  destroy. Every other action on it or its objects is denied: no ACL, replication, website,
+  logging, notification, inventory or Object Lock, and no object read or write.
 - The two server roles and the instance profile `bootstrap/` made: read them, pass each to its one
   service, attach `CloudWatchAgentServerPolicy` to the instance role (`enable_cloudwatch_agent`),
   and write an inline policy on the instance role alone (the grant to assume the snapshot writer,
@@ -531,7 +546,22 @@ both. In short:
 - Reading SSM public parameters (the AMI id).
 
 It opens no session on the server: `aws ssm start-session` runs with your own sign-in. It sits at
-the IAM root path, outside `/fermix-server/`, so it cannot change itself.
+the IAM root path, outside `/fermix-server/`, so it cannot change itself, and it can neither detach
+nor edit its denies.
+
+**What this holds, and what it does not.** Only `admin_role_arn` can assume the role, and
+`server/`'s AWS provider assumes it from your own sign-in, so a provider or plugin that misbehaves
+holds your credentials, not the role's: these limits contain a mistake in `server/`, or a module
+acting through the role, not a malicious binary in the Terraform run. Within the server stack the
+role still stops, starts and, once it lifts termination protection (which `allow_destroy` needs),
+terminates the server and the home on it. It writes the snapshot bucket's policy and the server
+key's policy, and IAM has no condition on a policy's contents, so it could grant another account
+Fermix's snapshots in the bucket (each also encrypted with the recovery passphrase); and the public
+access block it must write it can also turn off. The boundary keeps the role to the server stack's
+resources; it does not keep it away from the data in them. A security review found no way left for
+it to run code on the server or read its disk: it launches only Debian's image and snapshot, makes
+no volume from the server's snapshots, attaches none, opens no session, and cannot change the user
+data.
 
 ### Tags
 
@@ -578,7 +608,9 @@ and no plan or apply against an account:
 
 - `terraform fmt -check -recursive`;
 - `terraform init -backend=false`, `validate` and `test` for `bootstrap/`, `modules/server/` and
-  `server/`; the tests use mocked providers and make no AWS call;
+  `server/`; the tests use mocked providers, and `bootstrap/tests/sizes.tftest.hcl` a real one with
+  fake keys that renders the deploy role's policies locally against IAM's size limits; none makes
+  an AWS call;
 - the user data a server boots with, rendered with and without the CloudWatch agent, through
   `shellcheck`;
 - `tflint` (the recommended Terraform preset and the AWS ruleset, `.tflint.hcl`), failing on any
@@ -617,7 +649,8 @@ The variables, in `server/terraform.tfvars` and `bootstrap/terraform.tfvars`:
   `modules/server/locals.tf` together, and the tests with them. The bucket names already carry your
   account id and region; change one only if S3 says it is taken.
 - **The deploy role's policy and boundary** are close to IAM's size limits. Find room before adding
-  a statement, and run the tests: `bootstrap/tests/` holds each statement by its shape.
+  a statement, and run the tests: `bootstrap/tests/` holds each statement by its shape, and
+  `sizes.tftest.hcl` fails when a document passes its limit.
 - **The user data** runs once, at a server's first boot; a change reaches only servers created
   after it.
 - **The image.** `ami_owner_id` and the parameter in `modules/server/instance.tf` move together:
@@ -631,15 +664,18 @@ bootstrap/                  once, with your sign-in: state bucket and key, the d
   state.tf                  the bucket (versioned, KMS, TLS only, public access blocked) and its key
   permissions.tf            the deploy role's own policy: every action server/ uses, tag-scoped
   boundary.tf               its permissions boundary: the ceiling, and the denies
-  POLICY.md                 both, action by action, resource by resource
+  denies.tf                 the denies the boundary has no room for, a managed policy on the role
+  POLICY.md                 all three, action by action, resource by resource
   roles.tf                  fermix-server-deploy, trusted by admin_role_arn alone
   server_roles.tf           the instance role and profile, DLM's role and the snapshot writer, with fixed trusts
   workload.tf               the boundary on the instance and DLM roles
   sessions.tf               require_session_mfa: the deny on admin_role_arn's sessions without MFA
   trail.tf                  enable_cloudtrail: the least trail that lets EventBridge see API calls
-  alerts.tf                 the security alert topic and its key; its rules: sessions, commands
+  alerts.tf                 the security alert topic and its key; its rules: sessions, commands,
+                            instance attributes
   guardduty.tf              enable_guardduty: the region's detector, and its findings to that topic
-  tests/                    terraform test, mocked provider
+  tests/                    terraform test, mocked provider; sizes.tftest.hcl renders the policies
+                            with the real one, offline, against IAM's size limits
 modules/server/             one server
   network.tf                its own VPC, one public subnet, an internet gateway, no NAT gateway
   security_group.tf         nothing in, everything out

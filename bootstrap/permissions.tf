@@ -1,13 +1,13 @@
 # The deploy role's own policy: exactly what server/ needs, every action
 # named. It is an inline policy because it is longer than a managed policy may
 # be; the role's permissions boundary (boundary.tf) is the ceiling over it and
-# holds the denies.
+# holds the denies, with denies.tf for those it has no room for.
 #   - server/'s state object and lock, through the state key;
 #   - EC2 and VPC in the chosen region, on the resources server/ creates:
 #     created only carrying the server stack's tag, changed only while they
 #     carry it;
 #   - KMS keys created with the tag and managed only while they carry it;
-#   - the snapshot bucket, by its exact name (DESIGN.md);
+#   - the snapshot bucket, by its exact name (DESIGN.md), each write named;
 #   - the two server roles bootstrap made (server_roles.tf): read them, pass
 #     each to its one service, attach the CloudWatch agent's policy to the
 #     instance role and write the S3 backups' inline policy on it; never
@@ -33,6 +33,38 @@ locals {
 
   # What creates a tagged EC2 resource; CreateTags is allowed with them alone.
   ec2_creates = ["RunInstances", "CreateVpc", "CreateSubnet", "CreateRouteTable", "CreateSecurityGroup", "CreateInternetGateway"]
+
+  # The snapshot bucket's actions: what each resource in
+  # modules/server/storage.tf calls through the pinned provider (6.67.0), by
+  # IAM's name for it, which is not always the call's. The denies policy
+  # (denies.tf) refuses every other action on the bucket and its objects.
+  snapshot_bucket_actions = [
+    # aws_s3_bucket: CreateBucket with a private ACL, which needs
+    # s3:CreateBucket alone; tags at create need s3:TagResource, which nothing
+    # allows, so the provider creates it untagged and tags it with
+    # PutBucketTagging (and DeleteBucketTagging); HeadBucket; DeleteBucket.
+    "s3:CreateBucket",
+    "s3:DeleteBucket",
+    "s3:ListBucket",
+    "s3:PutBucketTagging",
+    # force_destroy empties it: ListObjectVersions (and DeleteObjects below).
+    "s3:ListBucketVersions",
+    # Refresh reads every setting of the bucket.
+    "s3:GetBucket*",
+    "s3:Get*Configuration",
+    # One write per resource; each resource's delete is its write's action.
+    "s3:PutBucketOwnershipControls", # _ownership_controls
+    "s3:PutBucketPublicAccessBlock", # _public_access_block
+    "s3:PutBucketVersioning",        # _versioning
+    "s3:PutEncryptionConfiguration", # _server_side_encryption_configuration
+    "s3:PutLifecycleConfiguration",  # _lifecycle_configuration
+    "s3:PutBucketPolicy",            # _policy
+    "s3:DeleteBucketPolicy",
+  ]
+
+  # On its objects: deleting them to empty it on destroy, never a read or a
+  # write.
+  snapshot_object_actions = ["s3:DeleteObject", "s3:DeleteObjectVersion"]
 }
 
 data "aws_iam_policy_document" "deploy" {
@@ -328,26 +360,12 @@ data "aws_iam_policy_document" "deploy" {
   }
 
   # ---------------------------------------------------------------- S3
-  # Bucket-level actions on the one bucket's ARN: s3:GetBucket* and
-  # s3:PutBucket* there reach its configuration, never an object (object
-  # actions authorize against object ARNs).
+  # Bucket-level actions on the one bucket's ARN, which never reach an object
+  # (object actions authorize against object ARNs): the reads, and each write
+  # storage.tf makes, named (snapshot_bucket_actions).
   statement {
-    sid = "ManageTheSnapshotBucket"
-    actions = [
-      "s3:CreateBucket",
-      "s3:DeleteBucket",
-      "s3:DeleteBucketPolicy",
-      "s3:ListBucket",
-      "s3:ListBucketVersions",
-      "s3:GetBucket*",
-      "s3:PutBucket*",
-      "s3:GetAccelerateConfiguration",
-      "s3:GetEncryptionConfiguration",
-      "s3:GetLifecycleConfiguration",
-      "s3:GetReplicationConfiguration",
-      "s3:PutEncryptionConfiguration",
-      "s3:PutLifecycleConfiguration",
-    ]
+    sid       = "ManageTheSnapshotBucket"
+    actions   = local.snapshot_bucket_actions
     resources = ["arn:${local.partition}:s3:::${local.snapshot_bucket}"]
   }
 
@@ -355,7 +373,7 @@ data "aws_iam_policy_document" "deploy" {
   # role deletes objects, never reads or writes them.
   statement {
     sid       = "EmptyTheSnapshotBucketOnDestroy"
-    actions   = ["s3:DeleteObject", "s3:DeleteObjectVersion"]
+    actions   = local.snapshot_object_actions
     resources = ["arn:${local.partition}:s3:::${local.snapshot_bucket}/*"]
   }
 

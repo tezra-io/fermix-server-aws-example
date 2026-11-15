@@ -188,6 +188,46 @@ run "a_command_emails_the_alert_topic" {
   }
 }
 
+# An instance attribute changed, or a change refused: user data is code the
+# instance runs at boot, with no session or command to email. Who, the
+# request (the instance and the attribute; CloudTrail hides user data), the
+# error code when refused, when and from where.
+run "an_instance_attribute_change_emails_the_alert_topic" {
+  command = plan
+
+  assert {
+    condition = (
+      aws_cloudwatch_event_rule.instance_attributes.name == "fermix-server-instance-attributes" &&
+      jsondecode(aws_cloudwatch_event_rule.instance_attributes.event_pattern) == {
+        source        = ["aws.ec2"]
+        "detail-type" = ["AWS API Call via CloudTrail"]
+        detail = {
+          eventSource = ["ec2.amazonaws.com"]
+          eventName   = ["ModifyInstanceAttribute"]
+        }
+      }
+    )
+    error_message = "the instance attributes rule matches EC2's ModifyInstanceAttribute calls"
+  }
+
+  assert {
+    condition = (
+      aws_cloudwatch_event_target.instance_attributes.rule == "fermix-server-instance-attributes" &&
+      aws_cloudwatch_event_target.instance_attributes.arn == "arn:aws:sns:us-east-1:111122223333:fermix-owner-security-alerts" &&
+      aws_cloudwatch_event_target.instance_attributes.input_transformer[0].input_paths == tomap({
+        call    = "$.detail.eventName"
+        who     = "$.detail.userIdentity.arn"
+        request = "$.detail.requestParameters"
+        error   = "$.detail.errorCode"
+        when    = "$.detail.eventTime"
+        from    = "$.detail.sourceIPAddress"
+      }) &&
+      alltrue([for v in ["<call>", "<who>", "<request>", "<error>", "<when>", "<from>"] : strcontains(aws_cloudwatch_event_target.instance_attributes.input_transformer[0].input_template, v)])
+    )
+    error_message = "an instance attribute's email goes to the alert topic and names who, the request, a refusal's error code and when"
+  }
+}
+
 # enable_guardduty: one detector per account and region, so bootstrap's.
 run "guardduty_is_off_by_default" {
   command = plan
@@ -267,10 +307,11 @@ run "security_alerts_have_a_topic_the_deploy_role_cannot_reach" {
           "arn:aws:events:us-east-1:111122223333:rule/fermix-server-sessions",
           "arn:aws:events:us-east-1:111122223333:rule/fermix-server-commands",
           "arn:aws:events:us-east-1:111122223333:rule/fermix-server-guardduty",
+          "arn:aws:events:us-east-1:111122223333:rule/fermix-server-instance-attributes",
         ])
       ])
     )
-    error_message = "the security alert topic takes messages from the three EventBridge rules alone, by their ARNs"
+    error_message = "the security alert topic takes messages from the four EventBridge rules alone, by their ARNs"
   }
 
   assert {

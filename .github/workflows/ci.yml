@@ -37,7 +37,9 @@ jobs:
       - name: Format
         run: terraform fmt -check -recursive -diff
 
-      # Mocked providers only: the tests make no AWS call.
+      # Mocked providers, and in bootstrap/tests/sizes.tftest.hcl a real one
+      # with fake keys and every account check skipped, which renders the
+      # policy documents locally: the tests make no AWS call.
       - name: Validate and test each stack and the module
         run: |
           for dir in bootstrap modules/server server; do
