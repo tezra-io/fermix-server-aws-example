@@ -14,7 +14,7 @@
 
 locals {
   security_topic = "fermix-owner-security-alerts"
-  security_rules = [for rule in ["sessions", "commands", "guardduty"] : "arn:${local.partition}:events:${var.region}:${local.account_id}:rule/${local.name_prefix}-${rule}"]
+  security_rules = [for rule in ["sessions", "commands", "guardduty", "instance-attributes"] : "arn:${local.partition}:events:${var.region}:${local.account_id}:rule/${local.name_prefix}-${rule}"]
 }
 
 resource "aws_kms_key" "security_alerts" {
@@ -74,7 +74,7 @@ resource "aws_sns_topic_policy" "security_alerts" {
 
 data "aws_iam_policy_document" "security_alerts_topic" {
   statement {
-    sid       = "TheThreeRulesPublish"
+    sid       = "TheRulesPublish"
     actions   = ["sns:Publish"]
     resources = [aws_sns_topic.security_alerts.arn]
 
@@ -182,6 +182,52 @@ resource "aws_cloudwatch_event_target" "commands" {
       "Who: <who>"
       "Request: <request>"
       "Command: <command>"
+      "When: <when>, from <from>"
+    EOT
+  }
+}
+
+# An instance attribute changes, or a change is refused: the user data is code
+# the instance runs at its next boot, with no session or command to email,
+# and the deploy role is denied it (denies.tf); termination protection and
+# the type are what server/'s own applies change. Who, the request (the
+# instance and the attribute; CloudTrail hides user data), the error code
+# when refused, when and from where. bootstrap does not know the instance id,
+# so every instance in this account and region; the email names it.
+resource "aws_cloudwatch_event_rule" "instance_attributes" {
+  name        = "${local.name_prefix}-instance-attributes"
+  description = "fermix-server: an EC2 instance attribute is changed, or a change refused, in this account and region."
+
+  event_pattern = jsonencode({
+    source        = ["aws.ec2"]
+    "detail-type" = ["AWS API Call via CloudTrail"]
+    detail = {
+      eventSource = ["ec2.amazonaws.com"]
+      eventName   = ["ModifyInstanceAttribute"]
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "instance_attributes" {
+  rule      = aws_cloudwatch_event_rule.instance_attributes.name
+  target_id = "alert-topic"
+  arn       = aws_sns_topic.security_alerts.arn
+
+  input_transformer {
+    input_paths = {
+      call    = "$.detail.eventName"
+      who     = "$.detail.userIdentity.arn"
+      request = "$.detail.requestParameters"
+      error   = "$.detail.errorCode"
+      when    = "$.detail.eventTime"
+      from    = "$.detail.sourceIPAddress"
+    }
+
+    input_template = <<-EOT
+      "fermix-server: an EC2 <call>."
+      "Who: <who>"
+      "Request: <request>"
+      "If refused: <error>"
       "When: <when>, from <from>"
     EOT
   }

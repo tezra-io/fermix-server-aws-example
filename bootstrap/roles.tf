@@ -1,8 +1,8 @@
 # The deploy role: every plan and apply of server/ runs as it, from the
 # owner's computer. Only the role the owner signs in with may assume it. Its
-# policy is permissions.tf, its boundary boundary.tf. It sits at the IAM root
-# path, outside /fermix-server/ where its own IAM rights stop, so it can never
-# change itself.
+# policy is permissions.tf, its boundary boundary.tf, the denies its boundary
+# has no room for denies.tf. It sits at the IAM root path, outside
+# /fermix-server/ where its own IAM rights stop, so it can never change itself.
 
 resource "aws_iam_role" "deploy" {
   name                 = "fermix-server-deploy"

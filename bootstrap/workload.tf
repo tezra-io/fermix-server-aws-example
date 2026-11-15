@@ -75,8 +75,8 @@ data "aws_iam_policy_document" "workload" {
   # EBS snapshots: AWSDataLifecycleManagerServiceRole's actions for a schedule of
   # snapshots in this region, held to the server stack: a snapshot only of a
   # volume carrying the tag, only carrying it itself (the policy copies the
-  # volume's tags and adds it), and a deletion only of a snapshot carrying it.
-  # Never sharing one.
+  # volume's tags and adds it), a tag only on such a snapshot, and a deletion
+  # only of a snapshot carrying it. Never sharing one.
   statement {
     sid = "DlmReads"
     actions = [
@@ -134,10 +134,33 @@ data "aws_iam_policy_document" "workload" {
     }
   }
 
+  # A tag only while DLM takes the snapshot, or on one that already carries
+  # the server tag, so no other snapshot is ever tagged into the stack (and
+  # with it into DlmDeletesTaggedSnapshots and the snapshot removal in
+  # README.md, "Removing the server"). Either way DLM tags its own: the tags in
+  # CreateSnapshot's request, or after it.
   statement {
-    sid       = "DlmTagsItsSnapshots"
+    sid       = "DlmTagsTheSnapshotsItTakes"
     actions   = ["ec2:CreateTags"]
     resources = ["arn:${local.partition}:ec2:${var.region}::snapshot/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "ec2:CreateAction"
+      values   = ["CreateSnapshot", "CreateSnapshots"]
+    }
+  }
+
+  statement {
+    sid       = "DlmTagsTheStacksSnapshots"
+    actions   = ["ec2:CreateTags"]
+    resources = ["arn:${local.partition}:ec2:${var.region}::snapshot/*"]
+
+    condition {
+      test     = "StringEquals"
+      variable = "aws:ResourceTag/${local.stack_tag_key}"
+      values   = [local.server_tag]
+    }
   }
 
   statement {

@@ -58,6 +58,12 @@ aws cloudtrail lookup-events --region "$region" \
   --lookup-attributes AttributeKey=Username,AttributeValue=<the session name in the email's ARN>
 ```
 
+An instance attribute's email (`fermix-server: an EC2 ModifyInstanceAttribute.`) comes with every
+apply that changes `allow_destroy` or `instance_type`. Any other, or one you did not run, may be a
+new user data, which runs at the instance's next boot: if it names the server and was not refused,
+do not start the instance until you have read its user data
+(`aws ec2 describe-instance-attribute --region "$region" --instance-id "$id" --attribute userData`).
+
 Then decide whether to rotate that principal's access. README.md, "Who can open a session", says
 what one account cannot stop. To see that the rule is working:
 
@@ -69,6 +75,31 @@ aws cloudwatch get-metric-statistics --region "$region" --namespace AWS/Events \
 
 `FailedInvocations` in place of `Invocations` counts deliveries the security alert topic
 refused.
+
+## Checking the deploy role's denies
+
+After a bootstrap apply that changes the deploy role's policies, try what they allow and refuse,
+as the deploy role, with EC2's dry run, which changes nothing:
+
+```sh
+role=$(terraform -chdir=bootstrap output -raw deploy_role_arn)
+bucket=$(terraform -chdir=server output -raw snapshot_bucket)
+eval "$(aws sts assume-role --role-arn "$role" --role-session-name probe \
+  --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text |
+  awk '{print "export AWS_ACCESS_KEY_ID="$1" AWS_SECRET_ACCESS_KEY="$2" AWS_SESSION_TOKEN="$3}')"
+# allowed: DryRunOperation
+aws ec2 modify-instance-attribute --dry-run --region "$region" --instance-id "$id" --disable-api-termination
+aws ec2 modify-instance-attribute --dry-run --region "$region" --instance-id "$id" --instance-type Value=t4g.small
+# refused: UnauthorizedOperation, explicit deny
+aws ec2 modify-instance-attribute --dry-run --region "$region" --instance-id "$id" --user-data Value=ZWNobw==
+aws ec2 modify-instance-attribute --dry-run --region "$region" --instance-id "$id" --attribute userData --value ZWNobw==
+aws s3api put-bucket-acl --bucket "$bucket" --acl private   # AccessDenied, explicit deny
+unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+```
+
+Each `modify-instance-attribute` call, refused or not, also sends the instance attribute email. A
+first pair that is refused means EC2 does not name the attribute as `denies.tf` expects: until that
+is fixed, `allow_destroy` and `instance_type` cannot be applied.
 
 ## Moving Fermix back before anything destroys the server
 

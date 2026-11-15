@@ -14,7 +14,10 @@
 # the CloudWatch agent's is attached; an inline policy goes on the instance
 # role alone; and a role is passed only to EC2 and DLM. A managed policy holds
 # at most 6,144 characters, so related statements share one and none carries a
-# Sid; the comment above each says what it is.
+# Sid; the comment above each says what it is. The denies it has no room for
+# are denies.tf's, a managed policy attached to the role: the snapshot bucket's
+# other actions, a key policy past the lockout check, and every instance
+# attribute but termination protection and the type.
 
 resource "aws_iam_policy" "boundary" {
   name        = local.deploy_boundary_name
@@ -321,7 +324,8 @@ data "aws_iam_policy_document" "boundary" {
 
   # ---------------------------------------------------------------- S3
   # The one bucket's configuration (bucket-level actions on its ARN never reach
-  # an object) and deleting objects to empty it on destroy.
+  # an object) and deleting objects to empty it on destroy. denies.tf refuses
+  # every action on it but the ones storage.tf's resources call.
   statement {
     actions = [
       "s3:CreateBucket",

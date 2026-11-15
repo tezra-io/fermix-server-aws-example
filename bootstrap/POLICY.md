@@ -1,25 +1,31 @@
 # What the deploy role may do, action by action
 
 `fermix-server-deploy` holds one inline policy, `permissions.tf`, under one permissions boundary,
-`boundary.tf`. Its rights are their intersection: an action must be allowed by both and denied by
-neither. The policy names each action and its condition; the boundary is the ceiling, with the
-denies that hold whatever else is ever attached to the role. `tests/bootstrap.tftest.hcl` holds
-every row by the policies' shape (a mocked plan cannot evaluate IAM), and each of those assertions
-was first seen to fail on a policy that broke it.
+`boundary.tf`, and one managed policy of denies alone, `denies.tf`, for the denies the boundary has
+no room for. Its rights are the policy's and the boundary's intersection: an action must be
+allowed by both and denied by none of the three. The policy names each action and its condition;
+the boundary is the ceiling, and its denies and `denies.tf`'s hold whatever else is ever attached
+to the role (an explicit deny in any of a role's policies refuses the request whatever another
+allows, and the role can neither detach nor edit `denies.tf`'s policy). `tests/bootstrap.tftest.hcl`
+holds every row by the policies' shape (a mocked plan cannot evaluate IAM), and each of those
+assertions was first seen to fail on a policy that broke it.
 
 `tag` is `fermix-server-stack = server`, the server stack's tag. "Request tag" is
 `aws:RequestTag/fermix-server-stack = server` on the request that creates the resource; "resource
 tag" is `aws:ResourceTag/fermix-server-stack = server` on a resource that exists. `<region>` is
 `var.region`; `<account>` is the account `admin_role_arn` names.
 
-Size: IAM allows 6,144 characters for a managed policy (in us-east-1 the boundary is about 6,000,
-and its statements carry no `Sid` to keep room) and 10,240 for a role's inline policies (the
-policy is about 10,000). DESIGN.md, "The deploy role's policy is inline, under a boundary", says
-what a longer region name costs.
+Size: IAM allows 6,144 characters for a managed policy and 10,240 for a role's inline policies,
+counted without whitespace. In us-east-1 the boundary is 5,985 (its statements carry no `Sid` to
+keep room), the policy 9,984, the denies 1,192 and the server roles' boundary 3,405; in a
+14-character region (`ap-southeast-2`) 6,085, 10,139, 1,202 and 3,455. `tests/sizes.tftest.hcl`
+renders all four, offline, in both regions and fails past a limit. DESIGN.md, "The deploy role's
+policy is inline, under a boundary", says what a longer region name costs.
 
 Each gap a security review of the boundary found is held on the boundary's document itself by
 `tests/findings.tftest.hcl`, which numbers and names them, one assertion per closing statement:
-undoing any one fails it.
+undoing any one fails it. A later review's four (the snapshot bucket's writes, the lockout check,
+DLM's tags, the user data) are held there too, on the documents that close them.
 
 "Tag keys" is `ForAllValues:StringEquals aws:TagKeys`: a request may write the stack's tag key
 alone (and `Name` on EC2). The boundary holds it on every statement that creates or tags.
@@ -62,17 +68,20 @@ later is denied too.
 | EC2 | the same | the VPC they go into | resource tag; denied without it (`vpc/vpc-*`) | denied without it | never into another VPC |
 | EC2 | `CreateInternetGateway` | `internet-gateway/*` | request tag, tag keys | the same | |
 | EC2 | `CreateTags` | any EC2 resource in `<region>` | only with `ec2:CreateAction` one of the six creates, or on a resource with the resource tag (tag keys `fermix-server-stack`, `Name`; the stack tag's value never changed) | denied without the resource tag unless `ec2:CreateAction` is set | no other resource can be given the tag |
-| EC2 | `ModifyVpcAttribute`, `DeleteVpc`, `ModifySubnetAttribute`, `DeleteSubnet`, `Attach`/`Detach`/`DeleteInternetGateway`, `CreateRoute`, `ReplaceRoute`, `DeleteRoute`, `AssociateRouteTable`, `DisassociateRouteTable`, `DeleteRouteTable`, `AuthorizeSecurityGroupEgress`, `RevokeSecurityGroupEgress`, `RevokeSecurityGroupIngress`, `DeleteSecurityGroup`, `Start`/`Stop`/`TerminateInstances`, `ModifyInstanceAttribute`, `ModifyInstanceMetadataOptions`, `ModifyInstanceMaintenanceOptions`, `ModifyVolume`, `DeleteTags` | any EC2 resource in `<region>` | resource tag | every EC2 action but the reads and the creates denied on a resource without the tag | changes only what server/ made |
+| EC2 | `ModifyVpcAttribute`, `DeleteVpc`, `ModifySubnetAttribute`, `DeleteSubnet`, `Attach`/`Detach`/`DeleteInternetGateway`, `CreateRoute`, `ReplaceRoute`, `DeleteRoute`, `AssociateRouteTable`, `DisassociateRouteTable`, `DeleteRouteTable`, `AuthorizeSecurityGroupEgress`, `RevokeSecurityGroupEgress`, `RevokeSecurityGroupIngress`, `DeleteSecurityGroup`, `Start`/`Stop`/`TerminateInstances`, `ModifyInstanceMetadataOptions`, `ModifyInstanceMaintenanceOptions`, `ModifyVolume`, `DeleteTags` | any EC2 resource in `<region>` | resource tag | every EC2 action but the reads and the creates denied on a resource without the tag | changes only what server/ made |
+| EC2 | `ModifyInstanceAttribute` | the instance | resource tag (with the changes above) | denied without the tag; `denies.tf` denies it unless the call sets termination protection or the type (`ec2:Attribute/DisableApiTermination` or `ec2:Attribute/InstanceType` present, or `ec2:Attribute` one of `disableApiTermination`, `instanceType`), so never the user data, kernel or RAM disk | `allow_destroy` and `instance_type`; the user data is read once (DESIGN.md, "The AMI and the user data are read once") and runs code at the next boot with no session or command to see it |
 | EC2 | any other action | | not allowed | allowed only on `<region>` resources with tag keys, and denied on any without the tag, so a create of any other kind (snapshot, image, key pair, launch template) is denied too; nothing that authorizes on no resource (an account's EC2 settings) | |
 | EC2 | `ModifySnapshotAttribute` | `*` | not allowed | denied (and in the server roles' boundary) | no snapshot is ever shared or made public |
 | KMS | `CreateKey`, `TagResource` | `*` (a key is tagged at create only through a statement on no particular key) | request tag, tag keys, `aws:RequestedRegion` | request tag, tag keys, region | a key is created carrying the tag |
 | KMS | `TagResource`, `UntagResource` | any existing key | resource tag | denied on any key without it, in any region | no key, the state key included, can be given the tag |
 | KMS | `DescribeKey`, `GetKeyPolicy`, `GetKeyRotationStatus`, `ListResourceTags`, `PutKeyPolicy`, `EnableKeyRotation`, `UpdateKeyDescription`, `ScheduleKeyDeletion`, `GenerateDataKeyWithoutPlaintext`, `Decrypt`, `ReEncryptFrom`, `ReEncryptTo` | keys in `<region>` | resource tag | `kms:*` with the resource tag and tag keys | the server key, through its life |
+| KMS | `CreateKey`, `PutKeyPolicy` with `kms:BypassPolicyLockoutSafetyCheck` true | `*` | allowed by the rows above | `denies.tf` denies it | no key policy skips KMS's lockout safety check; server/ never sets `bypass_policy_lockout_safety_check`. IAM has no condition on a key policy's contents (README.md, "What the deploy role can reach") |
 | KMS | `CreateGrant` | keys in `<region>` | resource tag and `kms:GrantIsForAWSResource` | resource tag | EC2's grant on the encrypted root volume |
 | KMS | `CreateAlias`, `DeleteAlias`, `UpdateAlias` | `alias/fermix-server` | exact alias | the same alias only (and authorized on the key it names, which is held to the tag) | the server key's name |
 | KMS | `ListAliases` | `*` | its own statement | its own statement | reading the aliases |
-| S3 | the snapshot bucket's configuration: `CreateBucket`, `DeleteBucket`, `DeleteBucketPolicy`, `ListBucket(Versions)`, `GetBucket*`, `PutBucket*`, get and put of its encryption, lifecycle, accelerate and replication | `fermix-server-snapshots-<account>-<region>` | exact name | the same name | by name, not tag (DESIGN.md, "The snapshot bucket is scoped by name, not by a tag") |
-| S3 | `DeleteObject`, `DeleteObjectVersion` | its objects | exact name | `DeleteObject*` there | emptying it on destroy (`allow_destroy`); never `GetObject` or `PutObject` |
+| S3 | the snapshot bucket: `CreateBucket`, `DeleteBucket`, `ListBucket`, `ListBucketVersions`, `GetBucket*`, `Get*Configuration`; the writes, one per resource in `modules/server/storage.tf`: `PutBucketTagging` (the bucket's tags), `PutBucketOwnershipControls`, `PutBucketPublicAccessBlock`, `PutBucketVersioning`, `PutEncryptionConfiguration`, `PutLifecycleConfiguration`, `PutBucketPolicy`, `DeleteBucketPolicy` (each resource's delete is its write's action) | `fermix-server-snapshots-<account>-<region>` | exact name | the same name | by name, not tag (DESIGN.md, "The snapshot bucket is scoped by name, not by a tag"); what the pinned provider calls |
+| S3 | `DeleteObject`, `DeleteObjectVersion` | its objects | exact name | `DeleteObject*` there | emptying it on destroy (`allow_destroy`) |
+| S3 | any other action: `PutBucketAcl`, `PutReplicationConfiguration`, `PutBucketWebsite`, `PutBucketCORS`, `PutBucketLogging`, `PutBucketNotification`, `PutInventoryConfiguration`, `PutBucketObjectLockConfiguration`, `PutBucketAbac`, `PutAccelerateConfiguration`, `PutObject`, `GetObject`, ... | the bucket and its objects | not allowed | `denies.tf` denies everything but the two rows above (`NotAction`), and `ListTagsForResource`, `TagResource`, `UntagResource`, which nothing allows | no ACL, replication, website or other bucket write nothing here uses, and no object read or write. The provider tries the last three first and, refused, falls back to `GetBucketTagging` and `PutBucketTagging`; they stay unallowed rather than denied, the refusal it has always had |
 | IAM | `GetRole`, `GetInstanceProfile`, `ListAttachedRolePolicies`, `ListRolePolicies` | the two server roles and the instance profile | exact ARNs | `Get*`, `List*` there | server/ reads them by name |
 | IAM | `PassRole` | the instance role; the DLM role | to `ec2.amazonaws.com`; to `dlm.amazonaws.com` | to EC2 or DLM only | each role to its one service |
 | IAM | `AttachRolePolicy`, `DetachRolePolicy` | the instance role | `iam:PolicyARN = CloudWatchAgentServerPolicy` | denied for any other policy | the CloudWatch agent (`enable_cloudwatch_agent`) |
@@ -106,7 +115,7 @@ The boundary on `fermix-server-instance` and `fermix-server-dlm`, whatever eithe
 | `ec2:CreateSnapshot`, `ec2:CreateSnapshots` | volumes and instances in `<region>` | resource tag | DLM snapshots only the server stack's volume |
 | the same | `snapshot/*` | request tag | into a snapshot carrying the tag (copied and added by the policy) |
 | `ec2:DeleteSnapshot` | `snapshot/*` | resource tag | DLM expires only the snapshots it took |
-| `ec2:CreateTags` | `snapshot/*` | | DLM tags its snapshots |
+| `ec2:CreateTags` | `snapshot/*` in `<region>` | `ec2:CreateAction` `CreateSnapshot` or `CreateSnapshots`; or, its own statement, resource tag | DLM tags a snapshot while it takes it or once it carries the tag, whichever way it tags; no other snapshot is ever tagged into the stack, and so into `DeleteSnapshot` above or the snapshot removal in README.md, "Removing the server" |
 | `events:*Rule*`, `*Targets*` | `rule/AwsDataLifecycleRule.managed-cwe.*` | | DLM's own rules |
 | KMS use through EC2 | keys in `<region>` | `kms:ViaService = ec2.<region>.amazonaws.com` | the encrypted volume's snapshots; the server key's policy names the DLM role |
 | `sts:AssumeRole` | `fermix-server-snapshot-writer` | | the instance role's grant, written by server/ with `enable_s3_backups`; no S3 or KMS right on the bucket is ever here |

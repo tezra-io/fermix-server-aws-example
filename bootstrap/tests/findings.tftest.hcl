@@ -2,7 +2,9 @@
 # numbered below. Each is held here on the boundary's own policy document
 # (and, for finding 6, on the server roles' boundary): the action, the
 # resource and the condition that closed it. Whatever else is ever attached to
-# the deploy role, these hold. Removing any one fails its assertion.
+# the deploy role, these hold. Removing any one fails its assertion. A later
+# review found four more, held at the end on the documents that close them:
+# the role's policy, its denies policy and the server roles' boundary.
 #   terraform -chdir=bootstrap test -filter=tests/findings.tftest.hcl
 #
 # Mocked provider and a plan, as tests/bootstrap.tftest.hcl. Assertions iterate
@@ -333,5 +335,136 @@ run "every_finding_holds_in_the_boundary" {
       )
     ])
     error_message = "finding 11: the boundary denies sns:TagResource and sns:UntagResource on a topic without the server tag"
+  }
+}
+
+# The later review: the snapshot bucket's writes, the server key's
+# policy, DLM's tags and the instance's user data. The bucket, the lockout
+# check and the user data are held by the deploy role's denies policy
+# (denies.tf), the boundary having no room; an explicit deny in any of the
+# role's policies refuses whatever another allows.
+run "every_later_finding_holds" {
+  command = plan
+
+  # The bucket: the role's policy names each write a resource in
+  # modules/server/storage.tf makes, no wildcard among them.
+  assert {
+    # S3's statements first: the state key's ARN, in a KMS statement, is
+    # unknown to a mocked plan.
+    condition = toset(flatten([
+      for s in [for s in data.aws_iam_policy_document.deploy.statement : s if anytrue([for a in coalesce(s.actions, toset([])) : startswith(a, "s3:")])] : [
+        for a in coalesce(s.actions, toset([])) : a if anytrue([for p in ["s3:Put", "s3:Delete", "s3:Create"] : startswith(a, p)])
+      ] if anytrue([for r in coalesce(s.resources, toset([])) : startswith(r, "arn:aws:s3:::fermix-server-snapshots-")])
+      ])) == toset([
+      "s3:CreateBucket",
+      "s3:DeleteBucket",
+      "s3:PutBucketTagging",
+      "s3:PutBucketOwnershipControls",
+      "s3:PutBucketPublicAccessBlock",
+      "s3:PutBucketVersioning",
+      "s3:PutEncryptionConfiguration",
+      "s3:PutLifecycleConfiguration",
+      "s3:PutBucketPolicy",
+      "s3:DeleteBucketPolicy",
+      "s3:DeleteObject",
+      "s3:DeleteObjectVersion",
+    ])
+    error_message = "bucket writes: the role's policy writes the snapshot bucket only as storage.tf's resources do, every write named"
+  }
+
+  # ...and is refused every other action on the bucket and its objects: no
+  # ACL, replication, website, logging, notification, inventory, Object Lock,
+  # ABAC, nor any object read or write.
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.deploy_denies.statement : (
+        s.effect == "Deny" &&
+        coalesce(s.resources, toset([])) == toset(["arn:aws:s3:::fermix-server-snapshots-111122223333-us-east-1", "arn:aws:s3:::fermix-server-snapshots-111122223333-us-east-1/*"]) &&
+        coalesce(s.not_actions, toset([])) == toset([
+          "s3:CreateBucket",
+          "s3:DeleteBucket",
+          "s3:ListBucket",
+          "s3:ListBucketVersions",
+          "s3:GetBucket*",
+          "s3:Get*Configuration",
+          "s3:PutBucketTagging",
+          "s3:PutBucketOwnershipControls",
+          "s3:PutBucketPublicAccessBlock",
+          "s3:PutBucketVersioning",
+          "s3:PutEncryptionConfiguration",
+          "s3:PutLifecycleConfiguration",
+          "s3:PutBucketPolicy",
+          "s3:DeleteBucketPolicy",
+          "s3:DeleteObject",
+          "s3:DeleteObjectVersion",
+          "s3:ListTagsForResource",
+          "s3:TagResource",
+          "s3:UntagResource",
+        ])
+      )
+    ])
+    error_message = "bucket writes: the role is denied every action on the snapshot bucket and its objects but those it names"
+  }
+
+  # The server key: no key policy written past KMS's lockout safety check.
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.deploy_denies.statement : (
+        s.effect == "Deny" &&
+        coalesce(s.actions, toset([])) == toset(["kms:CreateKey", "kms:PutKeyPolicy"]) &&
+        coalesce(s.resources, toset([])) == toset(["*"]) &&
+        length(s.condition) == 1 &&
+        anytrue([for c in s.condition : c.test == "Bool" && c.variable == "kms:BypassPolicyLockoutSafetyCheck" && c.values == tolist(["true"])])
+      )
+    ])
+    error_message = "key policy: the role is denied creating a key or writing a key policy that bypasses the lockout safety check"
+  }
+
+  # DLM tags a snapshot only while it takes it, or one that already carries
+  # the server tag, so no other snapshot is ever tagged into the stack.
+  assert {
+    condition = (
+      length([for s in data.aws_iam_policy_document.workload.statement : s if contains(coalesce(s.actions, toset([])), "ec2:CreateTags")]) == 2 &&
+      alltrue([
+        for s in data.aws_iam_policy_document.workload.statement : (
+          coalesce(s.actions, toset([])) == toset(["ec2:CreateTags"]) &&
+          coalesce(s.resources, toset([])) == toset(["arn:aws:ec2:us-east-1::snapshot/*"]) &&
+          length(s.condition) == 1 && (
+            anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "ec2:CreateAction" && toset(c.values) == toset(["CreateSnapshot", "CreateSnapshots"])]) ||
+            anytrue([for c in s.condition : c.test == "StringEquals" && c.variable == "aws:ResourceTag/fermix-server-stack" && c.values == tolist(["server"])])
+          )
+        ) if s.effect != "Deny" && contains(coalesce(s.actions, toset([])), "ec2:CreateTags")
+      ]) &&
+      anytrue([for s in data.aws_iam_policy_document.workload.statement : anytrue([for c in s.condition : c.variable == "ec2:CreateAction"]) if contains(coalesce(s.actions, toset([])), "ec2:CreateTags")]) &&
+      anytrue([for s in data.aws_iam_policy_document.workload.statement : anytrue([for c in s.condition : c.variable == "aws:ResourceTag/fermix-server-stack"]) if contains(coalesce(s.actions, toset([])), "ec2:CreateTags")])
+    )
+    error_message = "DLM tagging: the server roles tag a snapshot only in the create that takes it, or one already carrying the server tag"
+  }
+
+  # The user data: ModifyInstanceAttribute changes termination protection
+  # and the type alone (one attribute per call, in either of the API's two
+  # forms), never the user data, kernel or RAM disk, which run code at boot.
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.deploy_denies.statement : (
+        s.effect == "Deny" &&
+        coalesce(s.actions, toset([])) == toset(["ec2:ModifyInstanceAttribute"]) &&
+        coalesce(s.resources, toset([])) == toset(["*"]) &&
+        length(s.condition) == 3 &&
+        anytrue([for c in s.condition : c.test == "Null" && c.variable == "ec2:Attribute/DisableApiTermination" && c.values == tolist(["true"])]) &&
+        anytrue([for c in s.condition : c.test == "Null" && c.variable == "ec2:Attribute/InstanceType" && c.values == tolist(["true"])]) &&
+        anytrue([for c in s.condition : c.test == "StringNotEqualsIgnoreCaseIfExists" && c.variable == "ec2:Attribute" && toset(c.values) == toset(["disableApiTermination", "instanceType"])])
+      )
+    ])
+    error_message = "user data: the role is denied every instance attribute but termination protection and the instance type"
+  }
+
+  assert {
+    condition = (
+      aws_iam_policy.deploy_denies.name == "fermix-server-deploy-denies" && aws_iam_policy.deploy_denies.path == "/" &&
+      aws_iam_role_policy_attachment.deploy_denies.role == "fermix-server-deploy" &&
+      aws_iam_role_policy_attachment.deploy_denies.policy_arn == "arn:aws:iam::111122223333:policy/fermix-server-deploy-denies"
+    )
+    error_message = "the denies policy is attached to the deploy role, which may detach no policy but the CloudWatch agent's"
   }
 }
