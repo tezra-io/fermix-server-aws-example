@@ -53,8 +53,9 @@ locals {
     "s3:GetBucket*",
     "s3:Get*Configuration",
     # One write per resource; each resource's delete is its write's action.
+    # No public access block: the bucket keeps S3's own, and its write and
+    # delete (both s3:PutBucketPublicAccessBlock) fall to the denies.
     "s3:PutBucketOwnershipControls", # _ownership_controls
-    "s3:PutBucketPublicAccessBlock", # _public_access_block
     "s3:PutBucketVersioning",        # _versioning
     "s3:PutEncryptionConfiguration", # _server_side_encryption_configuration
     "s3:PutLifecycleConfiguration",  # _lifecycle_configuration

@@ -8,9 +8,9 @@
 # profile, and the boundary denies attaching or detaching any policy but the
 # CloudWatch agent's. It denies:
 #   - every action on the snapshot bucket and its objects but those
-#     storage.tf's resources call (permissions.tf), so no ACL, replication,
-#     website, logging, notification, inventory, Object Lock or ABAC, and no
-#     object read or write;
+#     storage.tf's resources call (permissions.tf), so no public access
+#     block, ACL, replication, website, logging, notification, inventory,
+#     Object Lock or ABAC, and no object read or write;
 #   - a key policy written past KMS's lockout safety check;
 #   - every instance attribute but termination protection (allow_destroy) and
 #     the instance type, so never the user data, kernel or RAM disk, which

@@ -246,8 +246,9 @@ Without an address there is no topic and no budget, and the alarm exists without
 ### The session email
 
 With `alert_emails` set in `bootstrap/`, every Session Manager session that starts or resumes in
-the account's region, every Run Command command sent there, and every EC2 instance attribute
-changed there (or a change refused), sends an email to each address through bootstrap's security
+the account's region, every Run Command command sent there, every EC2 instance attribute changed
+there (or a change refused), and every write that can widen who reaches the snapshot or state
+bucket (or such a write refused), sends an email to each address through bootstrap's security
 alert topic, `fermix-owner-security-alerts`:
 
 ```
@@ -266,11 +267,21 @@ and the command id; CloudTrail hides the commands themselves. An instance attrib
 the instance and the attribute (CloudTrail hides user data) and, when refused, the error code: a
 new user data is code the instance runs at its next boot without a session, which the deploy role
 is denied, and `server/`'s own applies send one each time `allow_destroy` or `instance_type`
-changes. bootstrap's EventBridge rule `fermix-server-sessions` matches CloudTrail's `StartSession`
-and `ResumeSession` and sends to the security alert topic, which takes messages from bootstrap's
-four rules alone, by their ARNs. bootstrap does not know the instance id, so the rules match every
-session, command and instance in the account and region, and the email names the instance. SNS
-emails only a confirmed subscription.
+changes. A bucket access email (`fermix-server: an S3 PutBucketPolicy on the snapshot or state
+bucket.`, rule `fermix-server-bucket-access`) names the bucket and the setting written and, when
+refused, the error code. It matches CloudTrail's `PutBucketPolicy`, `DeleteBucketPolicy`,
+`PutBucketPublicAccessBlock`, `DeleteBucketPublicAccessBlock`, `PutBucketAcl`,
+`PutBucketOwnershipControls`, `DeleteBucketOwnershipControls` and `PutBucketReplication` on those
+two buckets alone, by name. The deploy role writes the snapshot bucket's ownership controls and its
+policy, which can open it to another account ("What the deploy role can reach"), and `server/`'s
+own applies send one for each such write when they make, change or remove the bucket. Only an
+administrator, your own sign-in among them, can write the rest: the deploy role is denied the
+snapshot bucket's public access block, ACL and replication, and reaches only its state object in
+the state bucket. bootstrap's EventBridge rule `fermix-server-sessions` matches CloudTrail's
+`StartSession` and `ResumeSession` and sends to the security alert topic, which takes messages
+from bootstrap's five rules alone, by their ARNs. bootstrap does not know the instance id, so the
+session, command and instance attribute rules match every session, command and instance in the
+account and region, and the email names the instance. SNS emails only a confirmed subscription.
 RUNBOOK.md, "A session email you did not expect", says what to do with one.
 
 The topic is bootstrap's, not the server's `fermix-server-alerts`, because the deploy role manages
@@ -534,10 +545,12 @@ condition in all three. In short:
   managed only while they carry it; no other key or DLM policy can be given the tag, and no key
   policy is written past KMS's lockout safety check.
 - The snapshot bucket, by its exact name (DESIGN.md, "The snapshot bucket is scoped by name, not by
-  a tag"): reading its settings, the writes its resources make, each named (tags, ownership, public
-  access block, versioning, encryption, lifecycle, policy), and deleting its objects to empty it on
-  destroy. Every other action on it or its objects is denied: no ACL, replication, website,
-  logging, notification, inventory or Object Lock, and no object read or write.
+  a tag"): reading its settings, the writes its resources make, each named (tags, ownership,
+  versioning, encryption, lifecycle, policy), and deleting its objects to empty it on destroy.
+  Every other action on it or its objects is denied: no public access block, ACL, replication,
+  website, logging, notification, inventory or Object Lock, and no object read or write. The bucket
+  keeps the public access block S3 gives every new bucket, all four settings on, and the role can
+  neither change nor delete it.
 - The two server roles and the instance profile `bootstrap/` made: read them, pass each to its one
   service, attach `CloudWatchAgentServerPolicy` to the instance role (`enable_cloudwatch_agent`),
   and write an inline policy on the instance role alone (the grant to assume the snapshot writer,
@@ -556,9 +569,11 @@ acting through the role, not a malicious binary in the Terraform run. Within the
 role still stops, starts and, once it lifts termination protection (which `allow_destroy` needs),
 terminates the server and the home on it. It writes the snapshot bucket's policy and the server
 key's policy, and IAM has no condition on a policy's contents, so it could grant another account
-Fermix's snapshots in the bucket (each also encrypted with the recovery passphrase); and the public
-access block it must write it can also turn off. The boundary keeps the role to the server stack's
-resources; it does not keep it away from the data in them. A security review found no way left for
+Fermix's snapshots in the bucket (each also encrypted with the recovery passphrase). It cannot make
+the bucket public: the public access block stays on, out of its reach. Each policy write on the
+bucket, made or refused, emails you (rule `fermix-server-bucket-access`, "The session email"): it
+is seen, not prevented. The boundary keeps the role to the server stack's resources; it does not
+keep it away from the data in them. A security review found no way left for
 it to run code on the server or read its disk: it launches only Debian's image and snapshot, makes
 no volume from the server's snapshots, attaches none, opens no session, and cannot change the user
 data.
@@ -672,7 +687,7 @@ bootstrap/                  once, with your sign-in: state bucket and key, the d
   sessions.tf               require_session_mfa: the deny on admin_role_arn's sessions without MFA
   trail.tf                  enable_cloudtrail: the least trail that lets EventBridge see API calls
   alerts.tf                 the security alert topic and its key; its rules: sessions, commands,
-                            instance attributes
+                            instance attributes, bucket access
   guardduty.tf              enable_guardduty: the region's detector, and its findings to that topic
   tests/                    terraform test, mocked provider; sizes.tftest.hcl renders the policies
                             with the real one, offline, against IAM's size limits

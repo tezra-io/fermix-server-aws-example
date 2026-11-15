@@ -3,6 +3,14 @@
 # no bucket. The moved blocks keep a bucket that an earlier version of this
 # module made before the switch existed.
 
+# The bucket keeps S3's own public access block, all four settings on, which
+# the deploy role cannot change (below); trivy, finding no
+# aws_s3_bucket_public_access_block, reports its four checks as missing
+# (DESIGN.md, "The snapshot bucket is scoped by name, not by a tag").
+#trivy:ignore:AWS-0086
+#trivy:ignore:AWS-0087
+#trivy:ignore:AWS-0091
+#trivy:ignore:AWS-0093
 resource "aws_s3_bucket" "snapshots" {
   count = var.enable_s3_backups ? 1 : 0
 
@@ -24,14 +32,17 @@ resource "aws_s3_bucket_ownership_controls" "snapshots" {
   }
 }
 
-resource "aws_s3_bucket_public_access_block" "snapshots" {
-  count = var.enable_s3_backups ? 1 : 0
+# No public access block of the module's own: S3 turns all four settings on
+# for every new general purpose bucket, however it is made, and the deploy
+# role is denied changing them (bootstrap/denies.tf), so it cannot make the
+# bucket public. A block an older apply made is forgotten, not deleted: its
+# settings, the same four, stay on the bucket.
+removed {
+  from = aws_s3_bucket_public_access_block.snapshots
 
-  bucket                  = aws_s3_bucket.snapshots[0].id
-  block_public_acls       = true
-  block_public_policy     = true
-  ignore_public_acls      = true
-  restrict_public_buckets = true
+  lifecycle {
+    destroy = false
+  }
 }
 
 resource "aws_s3_bucket_versioning" "snapshots" {
@@ -135,8 +146,6 @@ resource "aws_s3_bucket_policy" "snapshots" {
       },
     ]
   })
-
-  depends_on = [aws_s3_bucket_public_access_block.snapshots]
 }
 
 moved {
@@ -147,11 +156,6 @@ moved {
 moved {
   from = aws_s3_bucket_ownership_controls.snapshots
   to   = aws_s3_bucket_ownership_controls.snapshots[0]
-}
-
-moved {
-  from = aws_s3_bucket_public_access_block.snapshots
-  to   = aws_s3_bucket_public_access_block.snapshots[0]
 }
 
 moved {

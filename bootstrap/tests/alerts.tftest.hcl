@@ -228,6 +228,64 @@ run "an_instance_attribute_change_emails_the_alert_topic" {
   }
 }
 
+# A bucket-level write that can widen who reaches the snapshot or the state
+# bucket, or a refused one: the deploy role writes the snapshot bucket's
+# policy, IAM has no condition on a policy's contents, and an administrator
+# can write the rest. By CloudTrail's names, which are not always IAM's or the API's
+# (the PutPublicAccessBlock call is PutBucketPublicAccessBlock), held to the
+# two buckets by name. Who, the request (the bucket and its new setting), the
+# error code when refused, when and from where.
+run "a_bucket_access_change_emails_the_alert_topic" {
+  command = plan
+
+  assert {
+    condition = (
+      aws_cloudwatch_event_rule.bucket_access.name == "fermix-server-bucket-access" &&
+      jsondecode(aws_cloudwatch_event_rule.bucket_access.event_pattern) == {
+        source        = ["aws.s3"]
+        "detail-type" = ["AWS API Call via CloudTrail"]
+        detail = {
+          eventSource = ["s3.amazonaws.com"]
+          eventName = [
+            "PutBucketPolicy",
+            "DeleteBucketPolicy",
+            "PutBucketPublicAccessBlock",
+            "DeleteBucketPublicAccessBlock",
+            "PutBucketAcl",
+            "PutBucketOwnershipControls",
+            "DeleteBucketOwnershipControls",
+            "PutBucketReplication",
+          ]
+          requestParameters = {
+            bucketName = [
+              "fermix-server-snapshots-111122223333-us-east-1",
+              "fermix-server-state-111122223333-us-east-1",
+            ]
+          }
+        }
+      }
+    )
+    error_message = "the bucket access rule matches S3's policy, public access block, ACL, ownership and replication writes on the snapshot and state buckets alone"
+  }
+
+  assert {
+    condition = (
+      aws_cloudwatch_event_target.bucket_access.rule == "fermix-server-bucket-access" &&
+      aws_cloudwatch_event_target.bucket_access.arn == "arn:aws:sns:us-east-1:111122223333:fermix-owner-security-alerts" &&
+      aws_cloudwatch_event_target.bucket_access.input_transformer[0].input_paths == tomap({
+        call    = "$.detail.eventName"
+        who     = "$.detail.userIdentity.arn"
+        request = "$.detail.requestParameters"
+        error   = "$.detail.errorCode"
+        when    = "$.detail.eventTime"
+        from    = "$.detail.sourceIPAddress"
+      }) &&
+      alltrue([for v in ["<call>", "<who>", "<request>", "<error>", "<when>", "<from>"] : strcontains(aws_cloudwatch_event_target.bucket_access.input_transformer[0].input_template, v)])
+    )
+    error_message = "a bucket access email goes to the alert topic and names who, the request, a refusal's error code and when"
+  }
+}
+
 # enable_guardduty: one detector per account and region, so bootstrap's.
 run "guardduty_is_off_by_default" {
   command = plan
@@ -308,10 +366,11 @@ run "security_alerts_have_a_topic_the_deploy_role_cannot_reach" {
           "arn:aws:events:us-east-1:111122223333:rule/fermix-server-commands",
           "arn:aws:events:us-east-1:111122223333:rule/fermix-server-guardduty",
           "arn:aws:events:us-east-1:111122223333:rule/fermix-server-instance-attributes",
+          "arn:aws:events:us-east-1:111122223333:rule/fermix-server-bucket-access",
         ])
       ])
     )
-    error_message = "the security alert topic takes messages from the four EventBridge rules alone, by their ARNs"
+    error_message = "the security alert topic takes messages from the five EventBridge rules alone, by their ARNs"
   }
 
   assert {
