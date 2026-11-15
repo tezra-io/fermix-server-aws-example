@@ -1,0 +1,26 @@
+# Terraform: providers, local state and plans never belong in the repository.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.plan.json
+crash.log
+crash.*.log
+*_override.tf
+*_override.tf.json
+
+# An owner's own values: variables and the backend's account-specific half.
+# Only the examples are committed.
+*.tfvars
+!*.tfvars.example
+*.tfbackend
+!*.tfbackend.example
+
+# Lock files belong to the root stacks (bootstrap, server); the module only
+# borrows their providers.
+modules/**/.terraform.lock.hcl
+
+# Editors and OS
+.DS_Store
+.idea/
+.vscode/

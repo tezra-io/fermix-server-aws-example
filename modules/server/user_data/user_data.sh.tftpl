@@ -1,0 +1,148 @@
+#!/bin/sh
+# fermix-server's first boot (modules/server/user_data). It never holds a
+# secret. It turns Debian's sshd off, installs AWS's SSM agent when the image
+# lacks it and, with enable_cloudwatch_agent, the CloudWatch agent, each from
+# AWS's own package with its signature checked against the key pinned here,
+# and with enable_s3_backups writes where Fermix keeps its snapshots. Nothing
+# else: Fermix's own first boot does the rest when the owner runs it.
+set -eu
+umask 022
+
+with_cloudwatch_agent='${cloudwatch_agent}'
+region='${region}'
+snapshot_bucket='${snapshot_bucket}'
+snapshot_role_arn='${snapshot_role_arn}'
+
+say() { printf 'fermix-server: %s\n' "$*"; }
+fail() { printf 'fermix-server: %s\n' "$*" >&2; exit 1; }
+
+work=$(mktemp -d /tmp/fermix-server.XXXXXX)
+trap 'rm -rf "$work"' EXIT
+chmod 0755 "$work"
+arch=$(dpkg --print-architecture)
+
+cat > "$work/amazon-ssm-agent.asc" <<'KEY'
+${ssm_agent_key}
+KEY
+cat > "$work/amazon-cloudwatch-agent.asc" <<'KEY'
+${cloudwatch_agent_key}
+KEY
+
+# apt-get, bounded: five tries per download, and at most five minutes for the
+# package lock, which the image's own daily apt timers may hold at first boot.
+apt_get() {
+  DEBIAN_FRONTEND=noninteractive apt-get -q -y -o Acquire::Retries=5 -o DPkg::Lock::Timeout=300 "$@"
+}
+
+# curl, its CA certificates and gpgv come from Debian's own signed archive
+# when the image lacks them. gpgv, not Debian 13's sqv: sqv refuses the SSM agent key's SHA-1
+# self-signature (DESIGN.md).
+ensure_tools() {
+  missing=''
+  command -v curl >/dev/null 2>&1 || missing="$missing curl"
+  [ -s /etc/ssl/certs/ca-certificates.crt ] || missing="$missing ca-certificates"
+  command -v gpgv >/dev/null 2>&1 || missing="$missing gpgv"
+  [ -z "$missing" ] && return 0
+  say "installing$missing from Debian's archive"
+  apt_get update || fail "apt-get update failed, so$missing could not be installed."
+  # shellcheck disable=SC2086 # one word per package
+  apt_get install --no-install-recommends $missing || fail "apt-get could not install$missing."
+}
+
+fetch() {
+  curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+    --retry 5 --retry-all-errors --retry-delay 5 --connect-timeout 20 --max-time 900 \
+    --output "$2" "$1" || fail "could not download $1."
+}
+
+# install_signed NAME URL FINGERPRINT: the package and its detached signature
+# from AWS, checked against the key that fingerprint names, the only key in
+# the keyring, then installed. Any failure installs nothing.
+install_signed() {
+  name=$1
+  url=$2
+  fingerprint=$3
+  fetch "$url" "$work/$name.deb"
+  fetch "$url.sig" "$work/$name.deb.sig"
+  sed -e '1,/^$/d' -e '/^=/,$d' "$work/$name.asc" | base64 -d > "$work/$name.gpg" ||
+    fail "the $name key in this user data does not decode."
+  if ! gpgv --status-fd 3 --keyring "$work/$name.gpg" "$work/$name.deb.sig" "$work/$name.deb" \
+    3> "$work/$name.status" 2> "$work/$name.gpgv"; then
+    cat "$work/$name.gpgv" >&2
+    fail "the $name package's signature does not verify, so it was not installed."
+  fi
+  grep -q "^\[GNUPG:\] VALIDSIG .* $fingerprint\$" "$work/$name.status" ||
+    fail "the $name package is not signed by $fingerprint, so it was not installed."
+  say "$name: good signature from $fingerprint"
+  apt_get install "$work/$name.deb" || fail "apt-get could not install $name."
+}
+
+ssm_agent() {
+  if [ -x /usr/bin/amazon-ssm-agent ]; then
+    say "the image carries the SSM agent ($(/usr/bin/amazon-ssm-agent --version 2>/dev/null || echo 'version unknown')); nothing to install"
+    return 0
+  fi
+  say "the image has no SSM agent; installing AWS's package"
+  install_signed amazon-ssm-agent \
+    "https://s3.$region.amazonaws.com/amazon-ssm-$region/latest/debian_$arch/amazon-ssm-agent.deb" \
+    ${ssm_agent_fingerprint}
+  systemctl enable amazon-ssm-agent.service || fail "systemctl could not enable amazon-ssm-agent."
+  systemctl restart amazon-ssm-agent.service || fail "amazon-ssm-agent did not start."
+  say "the SSM agent is $(systemctl is-active amazon-ssm-agent.service) ($(/usr/bin/amazon-ssm-agent --version 2>/dev/null))"
+}
+
+# The CloudWatch agent: memory and disk use, every minute, as CWAgent metrics by instance.
+cloudwatch_agent() {
+  install_signed amazon-cloudwatch-agent \
+    "https://amazoncloudwatch-agent-$region.s3.$region.amazonaws.com/debian/$arch/latest/amazon-cloudwatch-agent.deb" \
+    ${cloudwatch_agent_fingerprint}
+  config=/opt/aws/amazon-cloudwatch-agent/etc/fermix-server.json
+  cat > "$config" <<'JSON'
+${cloudwatch_agent_config}
+JSON
+  /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c "file:$config" ||
+    fail "the CloudWatch agent did not start with $config."
+  say "the CloudWatch agent sends memory and disk use"
+}
+
+# Where Fermix's first boot keeps this server's snapshots, read like its
+# --snapshot-bucket and --snapshot-region flags, and the snapshot writer role
+# its credentials helper assumes for them. Root's file, readable by all: it
+# names a bucket and a role, nothing secret. Written whole by a rename.
+snapshot_destination() {
+  install -d -m 0755 /etc/fermix
+  cat > /etc/fermix/.snapshot-destination.incoming <<DEST
+# Written by fermix-server's user data (enable_s3_backups): Fermix's first boot
+# keeps this server's snapshots in this bucket, signed with the role's session.
+bucket=$snapshot_bucket
+region=$region
+role_arn=$snapshot_role_arn
+DEST
+  chmod 0644 /etc/fermix/.snapshot-destination.incoming
+  mv -f /etc/fermix/.snapshot-destination.incoming /etc/fermix/snapshot-destination
+  say "Fermix's first boot will keep snapshots in s3://$snapshot_bucket (/etc/fermix/snapshot-destination)"
+}
+
+# Session Manager is the only way in: nothing listens on 22, even inside
+# the VPC. Debian's image runs ssh.service; a socket-activated ssh.socket is
+# masked too where the image ships one.
+sshd_off() {
+  if systemctl cat ssh.service >/dev/null 2>&1; then
+    systemctl disable --now ssh.service || fail "systemctl could not stop and disable ssh.service."
+  fi
+  if systemctl cat ssh.socket >/dev/null 2>&1; then
+    systemctl mask --now ssh.socket || fail "systemctl could not mask ssh.socket."
+  fi
+  say "sshd is off: ssh.service $(systemctl is-enabled ssh.service 2>/dev/null || true), ssh.socket $(systemctl is-enabled ssh.socket 2>/dev/null || true)"
+}
+
+sshd_off
+ensure_tools
+ssm_agent
+if [ "$with_cloudwatch_agent" = true ]; then
+  cloudwatch_agent
+fi
+if [ -n "$snapshot_bucket" ]; then
+  snapshot_destination
+fi
+say "done"

@@ -1,0 +1,28 @@
+# Copy to terraform.tfvars (gitignored) and fill in (README.md, "Step 2: fill in your values").
+
+# CHANGE ME: your AWS region; server/ must use the same one, and nothing lands anywhere else.
+region = "us-east-1"
+
+# CHANGE ME: the role (or IAM user) you sign in with, by its full ARN with its path; the deploy role trusts it alone.
+#   aws sts get-caller-identity --query Arn --output text
+#     -> arn:aws:sts::<account>:assumed-role/<RoleName>/<session>
+#   aws iam get-role --role-name <RoleName> --query Role.Arn --output text
+admin_role_arn = "arn:aws:iam::111122223333:role/OwnerAdmin"
+
+# CHANGE ME: your email address(es) for the account's security alerts: sessions, Run Command and
+# GuardDuty findings (README.md, "The session email"). Leave it out and they reach no one.
+# alert_emails = ["you@example.com"]
+
+# CHANGE ME (review): true makes admin_role_arn run no code on the server through Systems Manager
+# without MFA, an inline policy on your own sign-in role. A sign-in without MFA (any federated
+# one) then runs none (README.md, "Sessions with MFA").
+# require_session_mfa = true
+
+# CHANGE ME (review): the trail EventBridge needs to see the session email's calls, about $1 a month;
+# set false if a trail already logs this region's management events (README.md, "The session email").
+# enable_cloudtrail = true
+
+# CHANGE ME (review): a GuardDuty detector with Runtime Monitoring for EC2, which installs GuardDuty's
+# agent on the server; about $3 a month after the trial. Leave off if the region has a detector
+# (README.md, "GuardDuty").
+# enable_guardduty = true
