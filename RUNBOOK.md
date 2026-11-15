@@ -64,6 +64,25 @@ new user data, which runs at the instance's next boot: if it names the server an
 do not start the instance until you have read its user data
 (`aws ec2 describe-instance-attribute --region "$region" --instance-id "$id" --attribute userData`).
 
+A bucket access email (`fermix-server: an S3 <call> on the snapshot or state bucket.`) comes with
+every server/ apply that makes, changes or removes the snapshot bucket: its ownership controls and
+policy, or their deletes. Compare it with your own applies: the time, and the deploy role's
+session in Who. One that was refused (`If refused: AccessDenied`) changed nothing, but names who
+tried. Any other, one you did not run, or one on the state bucket that was not your own bootstrap
+apply, may have opened the bucket to another account or the public. Read what the bucket the email
+names holds now (an error naming no such policy or configuration means it was deleted):
+
+```sh
+aws s3api get-bucket-policy --region "$region" --bucket <the email's bucketName>
+aws s3api get-public-access-block --region "$region" --bucket <the email's bucketName>
+aws s3api get-bucket-ownership-controls --region "$region" --bucket <the email's bucketName>
+aws s3api get-bucket-replication --region "$region" --bucket <the email's bucketName>
+```
+
+`terraform -chdir=server plan` (the snapshot bucket) or `terraform -chdir=bootstrap plan` (the
+state bucket) shows what differs from what Terraform wrote, and an apply puts it back. Neither
+stack makes a replication rule: `aws s3api delete-bucket-replication` removes one.
+
 Then decide whether to rotate that principal's access. README.md, "Who can open a session", says
 what one account cannot stop. To see that the rule is working:
 
@@ -94,12 +113,16 @@ aws ec2 modify-instance-attribute --dry-run --region "$region" --instance-id "$i
 aws ec2 modify-instance-attribute --dry-run --region "$region" --instance-id "$id" --user-data Value=ZWNobw==
 aws ec2 modify-instance-attribute --dry-run --region "$region" --instance-id "$id" --attribute userData --value ZWNobw==
 aws s3api put-bucket-acl --bucket "$bucket" --acl private   # AccessDenied, explicit deny
+# AccessDenied, explicit deny; it asks for the four settings the bucket already has
+aws s3api put-public-access-block --bucket "$bucket" --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 ```
 
-Each `modify-instance-attribute` call, refused or not, also sends the instance attribute email. A
-first pair that is refused means EC2 does not name the attribute as `denies.tf` expects: until that
-is fixed, `allow_destroy` and `instance_type` cannot be applied.
+Each `modify-instance-attribute` call, refused or not, also sends the instance attribute email, and
+the refused `put-bucket-acl` and `put-public-access-block` a bucket access email each. A first pair
+that is refused means EC2 does not name the attribute as `denies.tf` expects: until that is fixed,
+`allow_destroy` and `instance_type` cannot be applied.
 
 ## Moving Fermix back before anything destroys the server
 

@@ -267,10 +267,9 @@ run "s3_backups_are_on_by_default" {
       length(aws_s3_bucket_versioning.snapshots) == 1 &&
       length(aws_s3_bucket_server_side_encryption_configuration.snapshots) == 1 &&
       length(aws_s3_bucket_lifecycle_configuration.snapshots) == 1 &&
-      length(aws_s3_bucket_public_access_block.snapshots) == 1 &&
       length(aws_s3_bucket_ownership_controls.snapshots) == 1
     )
-    error_message = "enable_s3_backups makes the snapshot bucket, with its versioning, encryption, lifecycle, policy and blocks"
+    error_message = "enable_s3_backups makes the snapshot bucket, with its versioning, encryption, lifecycle, policy and ownership"
   }
 
   assert {
@@ -315,7 +314,6 @@ run "s3_backups_off_write_and_grant_nothing" {
       length(aws_s3_bucket_versioning.snapshots) == 0 &&
       length(aws_s3_bucket_server_side_encryption_configuration.snapshots) == 0 &&
       length(aws_s3_bucket_lifecycle_configuration.snapshots) == 0 &&
-      length(aws_s3_bucket_public_access_block.snapshots) == 0 &&
       length(aws_s3_bucket_ownership_controls.snapshots) == 0
     )
     error_message = "without enable_s3_backups there is no snapshot bucket"
@@ -332,6 +330,28 @@ run "s3_backups_off_write_and_grant_nothing" {
       !strcontains(aws_instance.server.user_data, "fermix-server-snapshot-writer")
     )
     error_message = "without enable_s3_backups the user data hands first boot no destination"
+  }
+}
+
+# The snapshot bucket keeps the public access block S3 gives every new bucket
+# (all four settings on), and the module writes none, so the deploy role
+# needs no right to write one and is denied it (bootstrap/denies.tf). A plan
+# cannot name a resource the configuration does not declare, so this reads
+# the module's own files: no file declares one, and storage.tf forgets the one
+# an older apply made without destroying it, leaving its settings on AWS.
+run "the_snapshot_bucket_keeps_s3s_public_access_block" {
+  command = plan
+
+  assert {
+    condition = alltrue([
+      for f in fileset(path.module, "*.tf") : !strcontains(file("${path.module}/${f}"), "resource \"aws_s3_bucket_public_access_block\"")
+    ])
+    error_message = "no file in the module declares an aws_s3_bucket_public_access_block: the bucket keeps S3's own"
+  }
+
+  assert {
+    condition     = length(regexall("removed\\s*\\{\\s*from\\s*=\\s*aws_s3_bucket_public_access_block\\.snapshots\\s*lifecycle\\s*\\{\\s*destroy\\s*=\\s*false\\s*\\}\\s*\\}", file("${path.module}/storage.tf"))) == 1
+    error_message = "storage.tf forgets the public access block an older apply made (removed, destroy = false), so an apply never deletes it"
   }
 }
 

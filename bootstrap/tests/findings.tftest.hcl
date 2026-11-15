@@ -360,7 +360,6 @@ run "every_later_finding_holds" {
       "s3:DeleteBucket",
       "s3:PutBucketTagging",
       "s3:PutBucketOwnershipControls",
-      "s3:PutBucketPublicAccessBlock",
       "s3:PutBucketVersioning",
       "s3:PutEncryptionConfiguration",
       "s3:PutLifecycleConfiguration",
@@ -373,8 +372,8 @@ run "every_later_finding_holds" {
   }
 
   # ...and is refused every other action on the bucket and its objects: no
-  # ACL, replication, website, logging, notification, inventory, Object Lock,
-  # ABAC, nor any object read or write.
+  # public access block, ACL, replication, website, logging, notification,
+  # inventory, Object Lock, ABAC, nor any object read or write.
   assert {
     condition = anytrue([
       for s in data.aws_iam_policy_document.deploy_denies.statement : (
@@ -389,7 +388,6 @@ run "every_later_finding_holds" {
           "s3:Get*Configuration",
           "s3:PutBucketTagging",
           "s3:PutBucketOwnershipControls",
-          "s3:PutBucketPublicAccessBlock",
           "s3:PutBucketVersioning",
           "s3:PutEncryptionConfiguration",
           "s3:PutLifecycleConfiguration",
@@ -466,5 +464,36 @@ run "every_later_finding_holds" {
       aws_iam_role_policy_attachment.deploy_denies.policy_arn == "arn:aws:iam::111122223333:policy/fermix-server-deploy-denies"
     )
     error_message = "the denies policy is attached to the deploy role, which may detach no policy but the CloudWatch agent's"
+  }
+}
+
+# The snapshot bucket's public access block is S3's own (all four settings on
+# for every new bucket); modules/server writes none. The role may neither
+# write nor delete it: both calls authorize as s3:PutBucketPublicAccessBlock,
+# which no statement of its policy names, by name or wildcard, and which the
+# denies policy's NotAction on the bucket does not except, so it is denied.
+run "the_role_cannot_change_the_snapshot_buckets_public_access_block" {
+  command = plan
+
+  assert {
+    # S3's statements only: the state key's ARN is unknown to a mocked plan.
+    condition = !anytrue(flatten([
+      for s in [for s in data.aws_iam_policy_document.deploy.statement : s if anytrue([for a in coalesce(s.actions, toset([])) : startswith(a, "s3:")])] : [
+        for a in coalesce(s.actions, toset([])) : length(regexall("^${replace(a, "*", ".*")}$", "s3:PutBucketPublicAccessBlock")) > 0
+      ] if anytrue([for r in coalesce(s.resources, toset([])) : startswith(r, "arn:aws:s3:::fermix-server-snapshots-")])
+    ]))
+    error_message = "public access block: no statement of the role's policy allows s3:PutBucketPublicAccessBlock on the snapshot bucket"
+  }
+
+  assert {
+    condition = anytrue([
+      for s in data.aws_iam_policy_document.deploy_denies.statement : (
+        s.effect == "Deny" &&
+        contains(coalesce(s.resources, toset([])), "arn:aws:s3:::fermix-server-snapshots-111122223333-us-east-1") &&
+        length(coalesce(s.not_actions, toset([]))) > 0 &&
+        !anytrue([for a in s.not_actions : length(regexall("^${replace(a, "*", ".*")}$", "s3:PutBucketPublicAccessBlock")) > 0])
+      )
+    ])
+    error_message = "public access block: the denies policy refuses s3:PutBucketPublicAccessBlock on the snapshot bucket"
   }
 }

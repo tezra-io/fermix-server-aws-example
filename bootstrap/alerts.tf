@@ -14,7 +14,7 @@
 
 locals {
   security_topic = "fermix-owner-security-alerts"
-  security_rules = [for rule in ["sessions", "commands", "guardduty", "instance-attributes"] : "arn:${local.partition}:events:${var.region}:${local.account_id}:rule/${local.name_prefix}-${rule}"]
+  security_rules = [for rule in ["sessions", "commands", "guardduty", "instance-attributes", "bucket-access"] : "arn:${local.partition}:events:${var.region}:${local.account_id}:rule/${local.name_prefix}-${rule}"]
 }
 
 resource "aws_kms_key" "security_alerts" {
@@ -225,6 +225,72 @@ resource "aws_cloudwatch_event_target" "instance_attributes" {
 
     input_template = <<-EOT
       "fermix-server: an EC2 <call>."
+      "Who: <who>"
+      "Request: <request>"
+      "If refused: <error>"
+      "When: <when>, from <from>"
+    EOT
+  }
+}
+
+# A bucket-level write that can widen who reaches the snapshot or the state
+# bucket, or such a write refused. The deploy role writes the snapshot
+# bucket's policy and its ownership controls, and deletes each, and IAM has
+# no condition on a policy's contents, so the policy can open the bucket to
+# another account; the public access block, the ACL and replication it is
+# denied (denies.tf), an administrator is not. It cannot write the state
+# bucket's settings at all (boundary.tf), so a call there is the owner's
+# sign-in or a refusal, watched in the same rule at no cost.
+# CloudTrail's names, which are not always the API's or IAM's: the
+# PutPublicAccessBlock and DeletePublicAccessBlock calls are
+# PutBucketPublicAccessBlock and DeleteBucketPublicAccessBlock, and
+# PutBucketReplication is IAM's s3:PutReplicationConfiguration. Who, the
+# request (the bucket and its new setting), the error code when refused,
+# when and from where. server/'s own applies send one for each such write
+# when they make, change or remove the bucket.
+resource "aws_cloudwatch_event_rule" "bucket_access" {
+  name        = "${local.name_prefix}-bucket-access"
+  description = "fermix-server: a write that can widen who reaches the snapshot or state bucket is made, or refused."
+
+  event_pattern = jsonencode({
+    source        = ["aws.s3"]
+    "detail-type" = ["AWS API Call via CloudTrail"]
+    detail = {
+      eventSource = ["s3.amazonaws.com"]
+      eventName = [
+        "PutBucketPolicy",
+        "DeleteBucketPolicy",
+        "PutBucketPublicAccessBlock",
+        "DeleteBucketPublicAccessBlock",
+        "PutBucketAcl",
+        "PutBucketOwnershipControls",
+        "DeleteBucketOwnershipControls",
+        "PutBucketReplication",
+      ]
+      requestParameters = {
+        bucketName = [local.snapshot_bucket, local.state_bucket]
+      }
+    }
+  })
+}
+
+resource "aws_cloudwatch_event_target" "bucket_access" {
+  rule      = aws_cloudwatch_event_rule.bucket_access.name
+  target_id = "alert-topic"
+  arn       = aws_sns_topic.security_alerts.arn
+
+  input_transformer {
+    input_paths = {
+      call    = "$.detail.eventName"
+      who     = "$.detail.userIdentity.arn"
+      request = "$.detail.requestParameters"
+      error   = "$.detail.errorCode"
+      when    = "$.detail.eventTime"
+      from    = "$.detail.sourceIPAddress"
+    }
+
+    input_template = <<-EOT
+      "fermix-server: an S3 <call> on the snapshot or state bucket."
       "Who: <who>"
       "Request: <request>"
       "If refused: <error>"

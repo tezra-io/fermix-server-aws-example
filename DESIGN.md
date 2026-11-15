@@ -19,8 +19,19 @@ name, `fermix-server-state-<account>-<region>`, does not match it. On it the rol
 bucket's settings, make the writes `modules/server/storage.tf` makes, each named by IAM's action
 for what the pinned provider calls (a wildcard such as `s3:PutBucket*` would let it add an ACL, a
 website or any other setting), and delete objects (to empty it on destroy); `bootstrap/denies.tf`
-denies every other action on the bucket and its objects, so no ACL, replication, website, logging,
-notification, inventory or Object Lock, and no object read or write.
+denies every other action on the bucket and its objects, so no public access block, ACL,
+replication, website, logging, notification, inventory or Object Lock, and no object read or write.
+
+The module writes no public access block: S3 turns all four settings on for every new general
+purpose bucket, made by the API, the CLI, an SDK or CloudFormation as by the console (AWS News
+Blog, "Heads-Up: Amazon S3 Security Changes Are Coming in April of 2023"; done in every Region in
+April 2023), so the role, denied writing or deleting it (both `s3:PutBucketPublicAccessBlock`),
+cannot make the bucket public. A bucket made by an earlier version of this module keeps its block:
+`storage.tf`'s `removed` block forgets the resource without deleting it, and `server/`'s next plan
+says so ("will no longer be managed by Terraform, but will not be destroyed"). trivy, finding no
+`aws_s3_bucket_public_access_block`, reports its four checks as missing (AWS-0086, AWS-0087,
+AWS-0091, AWS-0093, high); they are ignored on the bucket alone (`#trivy:ignore`,
+`modules/server/storage.tf`), as AWS-0104 is on the egress rule.
 
 ## All outbound traffic is allowed
 
@@ -243,12 +254,14 @@ writer.
   provider assumes it from your own credentials, so its boundary and denies contain a mistake or a
   module acting through the role, not a malicious provider, which holds your credentials. They keep
   the role to the server stack's resources, not away from their data: it still terminates the
-  server and the home on it, writes the bucket's policy, the server key's policy and the public
-  access block, any of which can open the bucket to another account (IAM has no condition on a
-  policy's contents). It cannot change the user data, and no way is known for it to run code on
-  the server or read its disk: it launches only Debian's image and snapshot, makes no volume from
-  the server's snapshots and attaches none. Moving the bucket's and the key's policies into
-  `bootstrap/` would close the other account's way in; it is not done here.
+  server and the home on it, and writes the bucket's policy and the server key's policy, either of
+  which can open the bucket to another account (IAM has no condition on a policy's contents). It
+  cannot write the public access block, so it cannot make the bucket public, and each policy write
+  on the bucket, made or refused, emails you (`fermix-server-bucket-access`). It cannot change the
+  user data, and no way is known for it to run code on the server or read its disk: it launches
+  only Debian's image and snapshot, makes no volume from the server's snapshots and attaches none.
+  Moving the bucket's and the key's policies into `bootstrap/` would close the other account's way
+  in; it is not done here.
 - **DLM tags only the stack's snapshots.** `ec2:CreateTags` on every snapshot in the region would
   let the DLM role give any snapshot the server tag and, with it, `DeleteSnapshot` and the snapshot
   removal in README.md, "Removing the server". So the server roles' boundary lets it tag a snapshot
@@ -300,6 +313,8 @@ writer.
   - AWS-0089 (low), on both buckets: no server access logging. The state bucket is reached only by
     Terraform and the snapshot bucket by the snapshot writer's puts; access logs need a third
     bucket, and CloudTrail already records who changed either.
+  - AWS-0094 (low), on the snapshot bucket: no `aws_s3_bucket_public_access_block`. It keeps S3's
+    own, all four settings on ("The snapshot bucket is scoped by name, not by a tag").
   - AWS-0178 (medium): no VPC flow logs. The VPC holds one instance with no inbound rule; flow logs
     cost a log group or a bucket for traffic that is all the server's own outbound.
   - On the trail (`bootstrap/trail.tf`): AWS-0014 (medium), a single-region trail; AWS-0162 (low),
